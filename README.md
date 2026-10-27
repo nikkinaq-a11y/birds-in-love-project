@@ -2,6 +2,10 @@
 
 **Live site:** https://lab-5-bird-dance-fg1xtb-7acb1e-67-159-76-228.sslip.io
 
+**Cybernetic loop diagram:** [diagram/cybernetic-loop.png](diagram/cybernetic-loop.png) (editable source: [diagram/cybernetic-loop.excalidraw](diagram/cybernetic-loop.excalidraw), open it at excalidraw.com)
+
+![Cybernetic loop: player → webcam and PoseNet → Teachable Machine → comparator against the cue track → birds on screen → feedback to the player](diagram/cybernetic-loop.png)
+
 A webcam dance game built with TensorFlow.js and Teachable Machine. You are a male Western parotia performing a courtship display in a forest clearing, and a female watches from the branch above. A pose model recognizes your moves to the chicken dance. When you dance well she walks closer along the branch, and when you miss she backs away.
 
 ## Biomimicry
