@@ -38,6 +38,21 @@
     </div>
 
     <div class="rating" id="rating"></div>
+
+    <!-- Ending frames fade in over the scene -->
+    <img class="ending" id="end-win" src="assets/end-win.jpg" alt="The male and female parotia together, surrounded by hearts">
+    <img class="ending" id="end-lose" src="assets/end-lose.jpg" alt="The male parotia alone while the female sits with a rival on the branch">
+  </div>
+
+  <div class="end-screen" id="end-screen" hidden>
+    <div class="end-top">
+      <h1 id="end-title"></h1>
+      <p id="end-line"></p>
+    </div>
+    <div class="end-bottom">
+      <p id="end-stats" class="end-stats"></p>
+      <button class="start-btn" id="again-btn">Dance again</button>
+    </div>
   </div>
 
   <!-- Webcam -->
@@ -83,7 +98,6 @@
       <img class="leaf leaf-c" src="assets/leaf.png" alt="">
     </div>
     <div class="curtain-content" id="curtain-content" data-step="play">
-      <div id="results" class="results" hidden></div>
       <!-- PLAY and the intro share one spot: the intro fades in where PLAY was -->
       <div class="slot">
         <button class="play" id="play-btn" aria-label="Play">

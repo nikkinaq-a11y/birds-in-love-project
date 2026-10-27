@@ -1,5 +1,7 @@
 # Clearing Dance
 
+**Live site:** https://lab-5-bird-dance-fg1xtb-7acb1e-67-159-76-228.sslip.io
+
 A webcam dance game built with TensorFlow.js and Teachable Machine. You are a male Western parotia performing a courtship display in a forest clearing, and a female watches from the branch above. A pose model recognizes your moves to the chicken dance. When you dance well she walks closer along the branch, and when you miss she backs away.
 
 ## Biomimicry
@@ -14,10 +16,15 @@ Male Western parotias clear a patch of the forest floor and perform a precise "b
 
 1. The webcam feeds **PoseNet** (through `@teachablemachine/pose`), which finds your body.
 2. A **Teachable Machine** classifier trained on five classes (Beak, Flap, Boogie, Clap, Idle) labels each frame.
-3. The song runs at 94 BPM. Each verse cues 16 moves, 2 beats each, along the bottom of the screen. Choruses are free-dance breaks.
+3. The song runs at 94 BPM. Each verse cues 16 moves, 2 beats each, along the bottom of the screen, and the choruses are free-dance breaks.
 4. A move counts if the model detects it with at least 70% confidence for enough of its window: 50% of frames for PERFECT, 20% for GOOD.
 5. The male parotia mirrors whatever the model detects, so you can see what it sees.
-6. Her interest rises or falls with each move and sets where she stands on the branch. End at 60% or higher and she chooses you.
+6. The game is a tug of war. Her interest sets where she stands on the branch, and she starts in the middle (50%).
+   - Each move pulls her closer or pushes her away: PERFECT about +8.3, GOOD about +4.2, MISS about −4.2.
+   - **6 perfects** (or 12 goods) bring her all the way down to you, and you win.
+   - **12 misses** push her away completely, and you lose.
+   - Successes pull harder than misses push because players miss more often than they hit.
+   - The game ends as soon as she reaches either end. If the song runs out first, you win if she's closer than where she started.
 
 ## Run locally
 
@@ -39,4 +46,4 @@ Add `?debug` to the URL to show the model's live confidence for each class and t
 
 ## Tuning
 
-The constants at the top of `game.js` control timing and difficulty. If the cued moves are out of step with the song, change `MOVE_OFFSET` (0–3) or `FIRST_BEAT`. For difficulty, adjust `CONFIDENCE`, `PERFECT_RATIO`, `GOOD_RATIO` and `WIN_INTEREST`.
+The constants at the top of `game.js` control timing and difficulty. If the cued moves are out of step with the song, change `MOVE_OFFSET` (0–3) or `FIRST_BEAT`. For difficulty, adjust `PERFECTS_TO_WIN`, `MISSES_TO_LOSE` and `START_INTEREST` (the tug of war), or `CONFIDENCE`, `PERFECT_RATIO` and `GOOD_RATIO` (how strictly each move is judged).

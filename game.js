@@ -14,16 +14,26 @@ const CHORUS_STARTS = [44, 108, 172];
 const SECTION_BEATS = 32;
 const BEATS_PER_MOVE = 2;
 const MOVE_OFFSET = 0;                   // shift if the song's first move isn't Beak (0-3)
-const SONG_END_BEAT = 236;
+const VERSES_PLAYED = 4;                 // the whole song; it's only a backstop, the tug of war ends the game
 
 // Judging
 const CONFIDENCE = 0.7;     // a frame counts as a hit if the cued move is at least this likely
 const PERFECT_RATIO = 0.5;  // share of frames in a move window that must be hits
 const GOOD_RATIO = 0.2;
 const GRACE = 0.3;          // seconds ignored at the start of each move, to switch poses
-const START_INTEREST = 35;
-const WIN_INTEREST = 60;
 const PX_PER_SEC = 210;     // cue track scroll speed
+
+// Tug of war: her interest (0-100) sets where she stands on the branch, starting in the middle.
+// Successes pull her closer and misses push her away; 100 wins, 0 loses.
+// Pulls are stronger than pushes because players miss more often than they hit.
+const START_INTEREST = 50;
+const PERFECTS_TO_WIN = 6;
+const MISSES_TO_LOSE = 12;
+const INTEREST = {
+  perfect: (100 - START_INTEREST) / PERFECTS_TO_WIN,  // about +8.3
+  good: (100 - START_INTEREST) / PERFECTS_TO_WIN / 2, // about +4.2
+  miss: -START_INTEREST / MISSES_TO_LOSE,             // about -4.2
+};
 
 // Smoothing for the male's animation (judging still uses the raw predictions)
 const SMOOTHING = 0.25;     // how fast the averaged probabilities follow the model (0..1)
@@ -41,9 +51,10 @@ const els = {
   curtainContent: $("curtain-content"),
   playBtn: $("play-btn"),
   startBtn: $("start-btn"),
-  playLabel: $("play-label"),
   status: $("status"),
-  results: $("results"),
+  endWin: $("end-win"),
+  endLose: $("end-lose"),
+  endScreen: $("end-screen"),
   canvas: $("cam-canvas"),
   debug: $("debug"),
   score: $("score"),
@@ -83,6 +94,7 @@ document.fonts.ready.then(sizeIntro);
 window.addEventListener("resize", sizeIntro);
 $("resume-btn").addEventListener("click", resumeGame);
 $("restart-btn").addEventListener("click", startGame);
+$("again-btn").addEventListener("click", startGame);
 
 document.addEventListener("keydown", (e) => {
   if (![" ", "p", "P", "Escape"].includes(e.key)) return;
@@ -100,16 +112,14 @@ if (location.protocol === "file:") {
   els.status.textContent = "Open this page with Live Server. The model can't load from a file:// URL.";
 }
 
-// PLAY: first time, swap to the intro and load in the background; after a game, replay right away
+// PLAY: swap to the intro and load the camera and model in the background
 function onPlay() {
-  if (state === "idle") {
-    state = "intro";
-    els.curtainContent.dataset.step = "intro";
-    unlockAudio();
-    loadEverything().catch(() => {}); // errors are shown in the status line
-  } else if (state === "done") {
-    startGame();
-  }
+  if (state !== "idle") return;
+  state = "intro";
+  els.curtainContent.dataset.step = "intro";
+  els.status.textContent = "Allow camera access to dance";
+  unlockAudio();
+  loadEverything().catch(() => {}); // errors are shown in the status line
 }
 
 async function onStartDancing() {
@@ -144,30 +154,35 @@ function loadEverything() {
   return setupPromise;
 }
 
+// Camera first, so the permission prompt shows up alongside the intro text
 async function setup() {
-  model = await tmPose.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
-  labels = model.getClassLabels();
-  if (DEBUG) buildDebug();
-
-  els.status.textContent = "Allow camera access to dance";
   webcam = new tmPose.Webcam(200, 200, true);
   await webcam.setup();
   await webcam.play();
-  els.status.textContent = "";
+  els.status.textContent = "Camera on. You're ready!";
+
+  model = await tmPose.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
+  labels = model.getClassLabels();
+  if (DEBUG) buildDebug();
   requestAnimationFrame(loop);
 }
 
 function startGame() {
   game = { score: 0, combo: 0, best: 0, interest: START_INTEREST, perfect: 0, good: 0, miss: 0 };
-  female.target = 1 - game.interest / 100;
+  female.target = female.pos = 1 - game.interest / 100;
   timeline = buildTimeline();
   buildCueCards();
   renderHud();
 
   female.landed = false;
-  els.female.classList.remove("landing");
+  els.female.classList.remove("landing", "leaving");
+  els.endWin.classList.remove("show");
+  els.endLose.classList.remove("show");
+  els.endScreen.hidden = true;
+  document.body.classList.remove("ended");
+  clearInterval(songFade);
+  els.song.volume = 1;
 
-  els.results.hidden = true;
   els.curtainContent.dataset.step = "play";
   els.pauseScreen.hidden = true;
   els.pauseBtn.hidden = false;
@@ -252,11 +267,13 @@ function probabilityOf(prediction, className) {
 // ---------- Timeline ----------
 
 const beatTime = (beat) => FIRST_BEAT + (beat * 60) / BPM;
+const verses = VERSE_STARTS.slice(0, VERSES_PLAYED);
+const GAME_END = beatTime(verses[verses.length - 1] + SECTION_BEATS);
 
 function buildTimeline() {
   const events = [];
-  for (const start of VERSE_STARTS) {
-    const count = Math.min(SECTION_BEATS, SONG_END_BEAT - start) / BEATS_PER_MOVE;
+  for (const start of verses) {
+    const count = SECTION_BEATS / BEATS_PER_MOVE;
     for (let i = 0; i < count; i++) {
       const b = start + i * BEATS_PER_MOVE;
       events.push({
@@ -270,7 +287,7 @@ function buildTimeline() {
       });
     }
   }
-  for (const start of CHORUS_STARTS) {
+  for (const start of CHORUS_STARTS.filter((c) => beatTime(c) < GAME_END)) {
     events.push({ type: "free", move: "Free", start: beatTime(start), end: beatTime(start + SECTION_BEATS) });
   }
   return events.sort((a, b) => a.start - b.start);
@@ -311,10 +328,12 @@ function tick(prediction) {
       if (probabilityOf(prediction, e.move) >= CONFIDENCE) e.hits++;
     } else if (t >= e.end) {
       judge(e);
+      if (state !== "playing") return; // that move ended the game
     }
   }
 
-  if (t >= beatTime(SONG_END_BEAT) + 1 || els.song.ended) endGame();
+  // Backstop if the song runs out first: win if she's closer than where she started
+  if (t >= GAME_END + 0.5 || els.song.ended) endGame(game.interest > START_INTEREST);
 }
 
 function renderMessage(t) {
@@ -338,18 +357,20 @@ function judge(e) {
 
   if (result === "miss") {
     game.combo = 0;
-    game.interest -= 5;
   } else {
     game.combo++;
     game.best = Math.max(game.best, game.combo);
     game.score += (result === "perfect" ? 100 : 50) * (1 + Math.floor(game.combo / 8));
-    game.interest += result === "perfect" ? 6 : 3;
     if (result === "perfect" && game.combo % 4 === 0) spawnHearts(2);
   }
-  game.interest = Math.max(0, Math.min(100, game.interest));
+  game.interest = Math.max(0, Math.min(100, game.interest + INTEREST[result]));
   female.target = 1 - game.interest / 100;
   showRating(result);
   renderHud();
+
+  // small tolerance so the fractional steps land exactly on the ends
+  if (game.interest >= 99.99) endGame(true);
+  else if (game.interest <= 0.01) endGame(false);
 }
 
 function renderHud() {
@@ -365,26 +386,42 @@ function showRating(result) {
   els.rating.classList.add("show", result);
 }
 
-function endGame() {
+// Win: she flies down to him. Lose: she flies off. Then the matching ending frame fades in.
+function endGame(won) {
+  if (state === "done") return;
   state = "done";
-  els.song.pause();
   els.pauseBtn.hidden = true;
   els.message.innerHTML = "";
-  const won = game.interest >= WIN_INTEREST;
+  document.body.classList.add("ended");
+  fadeOutSong();
+
   if (won) {
     flyDown();
     setTimeout(() => spawnHearts(6), 1900);
+  } else {
+    flyAway();
   }
 
+  setTimeout(() => (won ? els.endWin : els.endLose).classList.add("show"), won ? 2600 : 1800);
   setTimeout(() => {
-    els.results.innerHTML = `
-      <h1>${won ? "She chose you!" : "She flew off…"}</h1>
-      <p>${won ? "Your display won her over." : "Your display didn't impress her this time."}</p>
-      <p>Score ${game.score} · Best combo ${game.best} · ${game.perfect} perfect · ${game.good} good · ${game.miss} missed</p>`;
-    els.results.hidden = false;
-    els.playLabel.textContent = "AGAIN";
-    els.curtains.classList.remove("open", "gone");
-  }, won ? 4200 : 2200);
+    $("end-title").textContent = won ? "She chose you!" : "She chose another…";
+    $("end-line").textContent = won ? "Your display won her over." : "Your display didn't impress her this time.";
+    $("end-stats").textContent = `Score ${game.score} · Best combo ${game.best} · ${game.perfect} perfect · ${game.good} good · ${game.miss} missed`;
+    els.endScreen.hidden = false;
+  }, won ? 4000 : 3200);
+}
+
+let songFade = null;
+
+function fadeOutSong() {
+  clearInterval(songFade);
+  songFade = setInterval(() => {
+    els.song.volume = Math.max(0, els.song.volume - 0.05);
+    if (els.song.volume === 0) {
+      clearInterval(songFade);
+      els.song.pause();
+    }
+  }, 75);
 }
 
 // ---------- Female ----------
@@ -403,6 +440,15 @@ function flyDown() {
   els.female.style.setProperty("--face", -1); // face him as she lands
   els.female.style.left = LANDING_SPOT[0] * 100 + "%";
   els.female.style.top = LANDING_SPOT[1] * 100 + "%";
+}
+
+function flyAway() {
+  female.landed = true;
+  els.female.classList.remove("walking");
+  els.female.classList.add("leaving");
+  els.female.style.setProperty("--face", 1); // the art faces right, the way she leaves
+  els.female.style.left = "112%";
+  els.female.style.top = "-6%";
 }
 
 // She walks toward her target spot, faces the way she's walking, then turns to watch him
@@ -425,7 +471,7 @@ function updateFemale(dt, now) {
   els.female.style.top = (y * 100).toFixed(2) + "%";
   els.female.style.setProperty("--face", female.face);
   els.female.classList.toggle("walking", moving);
-  els.female.classList.toggle("smitten", game ? game.interest >= WIN_INTEREST : false);
+  els.female.classList.toggle("smitten", game ? game.interest >= 75 : false);
 }
 
 function spawnHearts(n) {
