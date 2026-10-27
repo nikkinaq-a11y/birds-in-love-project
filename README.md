@@ -1,26 +1,23 @@
-# Strut: A Courtship Dance
+# Clearing Dance
 
-A webcam dance game built with TensorFlow.js and Teachable Machine. You play a rooster performing a courtship display (the chicken dance) for a hen. A pose model recognizes your moves, and the hen judges how well you keep to the routine.
+A webcam dance game built with TensorFlow.js and Teachable Machine. You are a male Western parotia performing a courtship display in a forest clearing, and a female watches from the branch above. A pose model recognizes your moves to the chicken dance. When you dance well she walks closer along the branch, and when you miss she backs away.
 
 ## Biomimicry
 
-Many birds court with a fixed, rehearsed routine, and the female chooses based on how precisely it is performed: Western parotias, blue-footed boobies, sage grouse on a lek, Clark's grebes. Strut turns that into an interaction:
+Male Western parotias clear a patch of the forest floor and perform a precise "ballerina dance" there, spreading their feathers into a skirt and waggling their head plumes. Females watch from a perch above and choose based on the performance. The game copies that setup:
 
-- **The display:** four moves on the beat: Beak, Flap, Boogie, Clap. Each round is faster, like an escalating display.
-- **The judge:** the hen. She moves closer, blushes and sends hearts when you hit moves, and turns away when you miss.
-- **Plumage:** the rooster's tail feathers brighten and glow as your combo grows, an honest signal of a good performance.
-
-The chicken dance itself started as a Swiss song, *Der Ententanz* ("The Duck Dance").
+- **The display:** the chicken dance moves (Beak, Flap, Boogie, Clap), each mapped to a parotia movement: head waggle, wing flap, skirt sway and wing sweep.
+- **The judge:** the female moves along the branch toward you or away from you, facing the way she walks. That movement is the feedback signal.
+- **Plumage:** the male glows brighter as your combo grows.
 
 ## How it works
 
 1. The webcam feeds **PoseNet** (through `@teachablemachine/pose`), which finds your body.
 2. A **Teachable Machine** classifier trained on five classes (Beak, Flap, Boogie, Clap, Idle) labels each frame.
-3. A timeline cues one move every 4 beats. A move counts if the model detects it with at least 70% confidence for enough of its window: 50% of frames for PERFECT, 20% for GOOD.
-4. The rooster mirrors whatever the model detects, so you can see what it sees.
-5. The hen's interest goes up or down after every move. Finish at 60% or higher and she accepts.
-
-The music is synthesized in the browser with the Web Audio API, so there are no audio files.
+3. The song runs at 94 BPM. Each verse cues 16 moves, 2 beats each, along the bottom of the screen. Choruses are free-dance breaks.
+4. A move counts if the model detects it with at least 70% confidence for enough of its window: 50% of frames for PERFECT, 20% for GOOD.
+5. The male parotia mirrors whatever the model detects, so you can see what it sees.
+6. Her interest rises or falls with each move and sets where she stands on the branch. End at 60% or higher and she chooses you.
 
 ## Run locally
 
@@ -28,15 +25,18 @@ The model files have to be served over HTTP, and camera access needs `localhost`
 
 1. Open this folder in VS Code.
 2. Right-click `index.html` and choose **Open with Live Server**.
-3. Allow camera access, step back so your head, arms and waist are in the camera box, then press **Begin the dance**.
+3. Press **Play**, allow camera access, and step back so your head, arms and waist are in the camera box.
+
+Add `?debug` to the URL to show the model's live confidence for each class and the song's beat counter.
 
 ## Files
 
-- `index.html`: page layout and the rooster and hen SVG art
-- `style.css`: scenery, character poses and animations
-- `game.js`: model loading, webcam loop, timeline, scoring, hen reactions, music
-- `model/`: the Teachable Machine pose model export (`model.json`, `metadata.json`, `weights.bin`)
+- `index.html`: scene, bird rig, leaf curtains
+- `style.css`: layout, dance animations, curtain transitions
+- `game.js`: model and webcam loop, song timeline, scoring, female movement
+- `model/`: the Teachable Machine pose model export
+- `assets/`: forest background, leaf, female, male parts (head, body, legs, spread and raised wings) and the song
 
 ## Tuning
 
-The constants at the top of `game.js` control difficulty: `ROUNDS` (tempos), `CONFIDENCE`, `PERFECT_RATIO`, `GOOD_RATIO` and `WIN_INTEREST`.
+The constants at the top of `game.js` control timing and difficulty. If the cued moves are out of step with the song, change `MOVE_OFFSET` (0–3) or `FIRST_BEAT`. For difficulty, adjust `CONFIDENCE`, `PERFECT_RATIO`, `GOOD_RATIO` and `WIN_INTEREST`.

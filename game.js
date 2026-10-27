@@ -1,137 +1,247 @@
-// Strut: a chicken-dance courtship game.
+// Clearing Dance: a parotia courtship display, played with your body.
 // Input: webcam -> PoseNet -> Teachable Machine classifier.
-// Output: the rooster mirrors your detected move; the hen judges it.
-// Feedback: her distance, mood, and the score tell you how to adjust.
+// Output: the male parotia mirrors your detected move; the female judges it from her branch.
+// Feedback: she walks closer along the branch when you dance well and backs away when you don't.
 
 const MODEL_URL = "./model/";
 const MOVES = ["Beak", "Flap", "Boogie", "Clap"];
-const ROUNDS = [{ bpm: 100 }, { bpm: 118 }, { bpm: 136 }]; // the song speeds up each time
-const CYCLES_PER_ROUND = 2;
-const BEATS_PER_MOVE = 4;
-const CONFIDENCE = 0.7;       // a frame counts as a hit if the cued move is at least this likely
-const PERFECT_RATIO = 0.5;    // share of frames in a move window that must be hits
+
+// Song timing, measured from assets/chicken-dance.mp3
+const BPM = 94.04;
+const FIRST_BEAT = 0.34;                 // seconds
+const VERSE_STARTS = [12, 76, 140, 204]; // in beats
+const CHORUS_STARTS = [44, 108, 172];
+const SECTION_BEATS = 32;
+const BEATS_PER_MOVE = 2;
+const MOVE_OFFSET = 0;                   // shift if the song's first move isn't Beak (0-3)
+const SONG_END_BEAT = 236;
+
+// Judging
+const CONFIDENCE = 0.7;     // a frame counts as a hit if the cued move is at least this likely
+const PERFECT_RATIO = 0.5;  // share of frames in a move window that must be hits
 const GOOD_RATIO = 0.2;
+const GRACE = 0.3;          // seconds ignored at the start of each move, to switch poses
+const START_INTEREST = 35;
 const WIN_INTEREST = 60;
-const LEAD_IN = 0.6;          // seconds before the first count-in beat
-const PX_PER_SEC = 240;       // cue track scroll speed
+const PX_PER_SEC = 210;     // cue track scroll speed
+
+// Smoothing for the male's animation (judging still uses the raw predictions)
+const SMOOTHING = 0.25;     // how fast the averaged probabilities follow the model (0..1)
+const POSE_HOLD_MS = 300;   // a new move must hold this long before he switches
+
+// Branch path the female walks along (scene fractions; first = closest to the male)
+const BRANCH = [
+  [0.47, 0.247], [0.50, 0.253], [0.55, 0.228], [0.60, 0.206],
+  [0.65, 0.179], [0.70, 0.150], [0.75, 0.133], [0.80, 0.111],
+];
 
 const $ = (id) => document.getElementById(id);
 const els = {
-  overlay: $("overlay"),
-  status: $("status"),
+  curtains: $("curtains"),
+  curtainContent: $("curtain-content"),
+  playBtn: $("play-btn"),
   startBtn: $("start-btn"),
+  playLabel: $("play-label"),
+  status: $("status"),
+  results: $("results"),
   canvas: $("cam-canvas"),
-  bars: $("bars"),
+  debug: $("debug"),
   score: $("score"),
   combo: $("combo"),
-  round: $("round"),
-  affection: $("affection-fill"),
-  moveName: $("move-name"),
-  beatDots: $("beat-dots"),
-  rating: $("rating"),
+  message: $("message"),
   cues: $("cues"),
-  rooster: $("rooster"),
-  hen: $("hen"),
-  henWrap: $("hen-wrap"),
+  rating: $("rating"),
+  male: $("male"),
+  female: $("female"),
+  song: $("song"),
+  pauseBtn: $("pause-btn"),
+  pauseScreen: $("pause-screen"),
 };
 const ctx = els.canvas.getContext("2d");
+const DEBUG = new URLSearchParams(location.search).has("debug");
 
 let model, webcam, labels;
-let audio, master, noiseBuffer;
-let timeline = null;   // { events, end }
-let audioStart = 0;
-let state = "loading"; // loading | ready | playing | done
+let setupPromise = null;
+let state = "idle"; // idle | intro | playing | paused | done
+let timeline = [];
 let game;
+const female = { pos: 1 - START_INTEREST / 100, target: 1 - START_INTEREST / 100, face: -1, stillSince: 0, landed: false };
+const LANDING_SPOT = [0.64, 0.86]; // on the clearing floor, beside the male
+const male = { smoothed: null, candidate: null, candidateSince: 0 };
 
-// ---------- Setup ----------
+// ---------- Start ----------
 
-els.startBtn.addEventListener("click", onStartClick);
+els.playBtn.addEventListener("click", onPlay);
+els.startBtn.addEventListener("click", onStartDancing);
+els.pauseBtn.addEventListener("click", pauseGame);
+
+// The intro text is kept no wider than the PLAY button
+function sizeIntro() {
+  els.curtainContent.style.setProperty("--play-w", els.playBtn.offsetWidth + "px");
+}
+document.fonts.ready.then(sizeIntro);
+window.addEventListener("resize", sizeIntro);
+$("resume-btn").addEventListener("click", resumeGame);
+$("restart-btn").addEventListener("click", startGame);
+
+document.addEventListener("keydown", (e) => {
+  if (![" ", "p", "P", "Escape"].includes(e.key)) return;
+  if (state === "playing") pauseGame();
+  else if (state === "paused") resumeGame();
+  else return;
+  e.preventDefault();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && state === "playing") pauseGame();
+});
 
 if (location.protocol === "file:") {
-  els.status.textContent = "Open this page with Live Server (or any web server). The model can't load from a file:// URL.";
+  els.status.textContent = "Open this page with Live Server. The model can't load from a file:// URL.";
 }
 
-async function onStartClick() {
-  if (state === "loading") {
-    els.startBtn.disabled = true;
-    try {
-      await setup();
-    } catch (err) {
-      console.error(err);
-      els.status.textContent = "Couldn't start: " + err.message;
-      els.startBtn.disabled = false;
-      return;
-    }
-    state = "ready";
-    els.status.textContent = "Step back until your head and arms fit in the camera box, then begin.";
-    els.startBtn.textContent = "Begin the dance";
-    els.startBtn.disabled = false;
-  } else if (state === "ready" || state === "done") {
+// PLAY: first time, swap to the intro and load in the background; after a game, replay right away
+function onPlay() {
+  if (state === "idle") {
+    state = "intro";
+    els.curtainContent.dataset.step = "intro";
+    unlockAudio();
+    loadEverything().catch(() => {}); // errors are shown in the status line
+  } else if (state === "done") {
     startGame();
   }
 }
 
+async function onStartDancing() {
+  if (state !== "intro") return;
+  if (!model) unlockAudio();
+  els.startBtn.disabled = true;
+  els.startBtn.textContent = "Getting ready…";
+  try {
+    await loadEverything();
+  } catch {
+    els.startBtn.disabled = false;
+    els.startBtn.textContent = "Try again";
+    return;
+  }
+  startGame();
+}
+
+// Let the song play later even though loading happens between the click and the music
+function unlockAudio() {
+  els.song.play().then(() => { if (state !== "playing") els.song.pause(); }).catch(() => {});
+}
+
+function loadEverything() {
+  if (!setupPromise) {
+    setupPromise = setup().catch((err) => {
+      console.error(err);
+      els.status.textContent = "Couldn't start: " + err.message;
+      setupPromise = null;
+      throw err;
+    });
+  }
+  return setupPromise;
+}
+
 async function setup() {
-  els.status.textContent = "Loading the model…";
   model = await tmPose.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
   labels = model.getClassLabels();
-  buildBars();
+  if (DEBUG) buildDebug();
 
-  els.status.textContent = "Waiting for camera permission…";
+  els.status.textContent = "Allow camera access to dance";
   webcam = new tmPose.Webcam(200, 200, true);
   await webcam.setup();
   await webcam.play();
-
-  // Audio must be created from a user gesture
-  audio = new (window.AudioContext || window.webkitAudioContext)();
-  master = audio.createGain();
-  master.gain.value = 0.5;
-  master.connect(audio.destination);
-  noiseBuffer = makeNoise();
-
+  els.status.textContent = "";
   requestAnimationFrame(loop);
 }
 
-function buildBars() {
-  els.bars.innerHTML = labels
-    .map((l) => `<div class="bar" data-cls="${l}"><span>${l}</span><div class="bar-track"><div class="bar-fill"></div></div></div>`)
-    .join("");
+function startGame() {
+  game = { score: 0, combo: 0, best: 0, interest: START_INTEREST, perfect: 0, good: 0, miss: 0 };
+  female.target = 1 - game.interest / 100;
+  timeline = buildTimeline();
+  buildCueCards();
+  renderHud();
+
+  female.landed = false;
+  els.female.classList.remove("landing");
+
+  els.results.hidden = true;
+  els.curtainContent.dataset.step = "play";
+  els.pauseScreen.hidden = true;
+  els.pauseBtn.hidden = false;
+  els.curtains.classList.add("open");
+  setTimeout(() => els.curtains.classList.add("gone"), 1800);
+
+  els.song.currentTime = 0;
+  els.song.play();
+  state = "playing";
+}
+
+function pauseGame() {
+  if (state !== "playing") return;
+  state = "paused";
+  els.song.pause();
+  els.pauseScreen.hidden = false;
+}
+
+function resumeGame() {
+  if (state !== "paused") return;
+  els.pauseScreen.hidden = true;
+  els.song.play();
+  state = "playing";
 }
 
 // ---------- Main loop ----------
 
-async function loop() {
+let lastFrame = performance.now();
+
+async function loop(now) {
   webcam.update();
-  const { pose, posenetOutput } = await model.estimatePose(webcam.canvas);
+  const { posenetOutput } = await model.estimatePose(webcam.canvas);
   const prediction = await model.predict(posenetOutput);
 
-  drawCam(pose);
-  updateBars(prediction);
-  updateRooster(prediction);
+  ctx.drawImage(webcam.canvas, 0, 0);
+  updateMale(prediction, now);
+  if (DEBUG) updateDebug(prediction);
   if (state === "playing") tick(prediction);
+
+  const dt = Math.min(0.1, (now - lastFrame) / 1000);
+  lastFrame = now;
+  updateFemale(dt, now);
 
   requestAnimationFrame(loop);
 }
 
-function drawCam(pose) {
-  ctx.drawImage(webcam.canvas, 0, 0);
-  if (pose) {
-    tmPose.drawKeypoints(pose.keypoints, 0.5, ctx);
-    tmPose.drawSkeleton(pose.keypoints, 0.5, ctx);
+// The male shows what the model thinks you're doing, smoothed so he doesn't flicker between moves
+function updateMale(prediction, now) {
+  male.smoothed = prediction.map((p, i) =>
+    male.smoothed ? male.smoothed[i] + (p.probability - male.smoothed[i]) * SMOOTHING : p.probability
+  );
+  let best = 0;
+  male.smoothed.forEach((v, i) => { if (v > male.smoothed[best]) best = i; });
+  const cls = prediction[best].className;
+  const next = cls !== "Idle" && male.smoothed[best] >= 0.6 ? cls.toLowerCase() : "idle";
+
+  if (next === els.male.dataset.pose) {
+    male.candidate = null;
+  } else if (next !== male.candidate) {
+    male.candidate = next;
+    male.candidateSince = now;
+  } else if (now - male.candidateSince >= POSE_HOLD_MS) {
+    setMalePose(next);
+    male.candidate = null;
   }
 }
 
-function updateBars(prediction) {
-  prediction.forEach((p, i) => {
-    els.bars.children[i].querySelector(".bar-fill").style.width = (p.probability * 100).toFixed(0) + "%";
-  });
-}
-
-// The rooster shows what the model thinks you're doing
-function updateRooster(prediction) {
-  const top = prediction.reduce((a, b) => (b.probability > a.probability ? b : a));
-  const pose = top.className !== "Idle" && top.probability >= 0.6 ? top.className.toLowerCase() : "idle";
-  if (els.rooster.dataset.pose !== pose) els.rooster.dataset.pose = pose;
+// Start the new move's animation in step with the song's beat
+function setMalePose(pose) {
+  const beat = 60 / BPM;
+  const t = state === "playing" ? els.song.currentTime - FIRST_BEAT : performance.now() / 1000;
+  const phase = ((t % beat) + beat) % beat;
+  els.male.style.setProperty("--phase", `-${phase.toFixed(3)}s`);
+  els.male.dataset.pose = pose;
 }
 
 function probabilityOf(prediction, className) {
@@ -141,33 +251,39 @@ function probabilityOf(prediction, className) {
 
 // ---------- Timeline ----------
 
+const beatTime = (beat) => FIRST_BEAT + (beat * 60) / BPM;
+
 function buildTimeline() {
   const events = [];
-  let t = LEAD_IN;
-  ROUNDS.forEach((r, round) => {
-    const beat = 60 / r.bpm;
-    events.push({ type: "count", start: t, dur: 4 * beat, beat, round });
-    t += 4 * beat;
-    for (let c = 0; c < CYCLES_PER_ROUND; c++) {
-      for (const move of MOVES) {
-        const dur = BEATS_PER_MOVE * beat;
-        events.push({ type: "move", move, start: t, dur, beat, round, frames: 0, hits: 0, judged: false });
-        t += dur;
-      }
+  for (const start of VERSE_STARTS) {
+    const count = Math.min(SECTION_BEATS, SONG_END_BEAT - start) / BEATS_PER_MOVE;
+    for (let i = 0; i < count; i++) {
+      const b = start + i * BEATS_PER_MOVE;
+      events.push({
+        type: "move",
+        move: MOVES[(i + MOVE_OFFSET) % MOVES.length],
+        start: beatTime(b),
+        end: beatTime(b + BEATS_PER_MOVE),
+        frames: 0,
+        hits: 0,
+        judged: false,
+      });
     }
-  });
-  return { events, end: t };
+  }
+  for (const start of CHORUS_STARTS) {
+    events.push({ type: "free", move: "Free", start: beatTime(start), end: beatTime(start + SECTION_BEATS) });
+  }
+  return events.sort((a, b) => a.start - b.start);
 }
 
 function buildCueCards() {
   els.cues.innerHTML = "";
-  for (const e of timeline.events) {
-    if (e.type !== "move") continue;
+  for (const e of timeline) {
     const card = document.createElement("div");
     card.className = "cue";
     card.dataset.move = e.move;
-    card.style.width = e.dur * PX_PER_SEC - 6 + "px";
-    card.textContent = e.move;
+    card.style.width = (e.end - e.start) * PX_PER_SEC - 6 + "px";
+    card.textContent = e.type === "free" ? "Free dance! Show off for her" : e.move;
     els.cues.appendChild(card);
     e.card = card;
   }
@@ -175,68 +291,42 @@ function buildCueCards() {
 
 function renderCues(t) {
   const hitX = els.cues.clientWidth * 0.18;
-  for (const e of timeline.events) {
-    if (!e.card) continue;
+  for (const e of timeline) {
     const x = hitX + (e.start - t) * PX_PER_SEC;
-    e.card.style.transform = `translateX(${x}px)`;
+    e.card.style.transform = `translateX(${x.toFixed(1)}px)`;
   }
 }
 
 // ---------- Game ----------
 
-function startGame() {
-  game = { score: 0, combo: 0, best: 0, interest: 40, perfect: 0, good: 0, miss: 0 };
-  timeline = buildTimeline();
-  buildCueCards();
-  els.henWrap.classList.remove("leaving", "won");
-  setMood("neutral");
-  renderHud();
-
-  if (audio.state === "suspended") audio.resume();
-  audioStart = audio.currentTime + 0.1;
-  scheduleMusic();
-
-  els.overlay.classList.add("hidden");
-  state = "playing";
-}
-
 function tick(prediction) {
-  const t = audio.currentTime - audioStart;
+  const t = els.song.currentTime;
   renderCues(t);
+  renderMessage(t);
 
-  const current = timeline.events.find((e) => t >= e.start && t < e.start + e.dur);
-  renderMoveLabel(current, t);
-
-  for (const e of timeline.events) {
+  for (const e of timeline) {
     if (e.type !== "move" || e.judged) continue;
-    // Ignore the first part of each window so you have time to switch moves
-    const grace = Math.min(0.35, e.beat * 0.6);
-    if (t >= e.start + grace && t < e.start + e.dur) {
+    if (t >= e.start + GRACE && t < e.end) {
       e.frames++;
       if (probabilityOf(prediction, e.move) >= CONFIDENCE) e.hits++;
-    } else if (t >= e.start + e.dur) {
+    } else if (t >= e.end) {
       judge(e);
     }
   }
 
-  if (t >= timeline.end + 0.5) endGame();
+  if (t >= beatTime(SONG_END_BEAT) + 1 || els.song.ended) endGame();
 }
 
-function renderMoveLabel(e, t) {
-  if (!e) {
-    els.moveName.textContent = "";
-    els.beatDots.innerHTML = "";
-    return;
+function renderMessage(t) {
+  const firstMove = beatTime(VERSE_STARTS[0]);
+  let html = "";
+  if (t < firstMove) {
+    const beatsLeft = Math.ceil((firstMove - t) * BPM / 60);
+    html = beatsLeft <= 4
+      ? String(beatsLeft)
+      : "Step into the clearing<small>Back up until your head, arms and waist fit in the camera</small>";
   }
-  const beatIndex = Math.floor((t - e.start) / e.beat);
-  if (e.type === "count") {
-    els.round.textContent = e.round + 1;
-    els.moveName.textContent = e.round === 0 ? 4 - beatIndex : beatIndex < 2 ? "Faster!" : 4 - beatIndex;
-    els.beatDots.innerHTML = "";
-  } else {
-    els.moveName.textContent = e.move;
-    els.beatDots.innerHTML = Array.from({ length: BEATS_PER_MOVE }, (_, i) => `<span class="${i <= beatIndex ? "on" : ""}"></span>`).join("");
-  }
+  if (els.message.innerHTML !== html) els.message.innerHTML = html;
 }
 
 function judge(e) {
@@ -248,23 +338,16 @@ function judge(e) {
 
   if (result === "miss") {
     game.combo = 0;
-    game.interest -= 7;
-    setMood("annoyed");
-    setTimeout(restMood, 700);
+    game.interest -= 5;
   } else {
     game.combo++;
     game.best = Math.max(game.best, game.combo);
-    const base = result === "perfect" ? 100 : 50;
-    game.score += base * (1 + Math.floor(game.combo / 4));
-    game.interest += result === "perfect" ? 9 : 4;
-    setMood(result === "perfect" ? "smitten" : "interested");
-    if (result === "perfect") {
-      spawnHearts(3);
-      chirp(audio.currentTime);
-    }
-    setTimeout(restMood, 900);
+    game.score += (result === "perfect" ? 100 : 50) * (1 + Math.floor(game.combo / 8));
+    game.interest += result === "perfect" ? 6 : 3;
+    if (result === "perfect" && game.combo % 4 === 0) spawnHearts(2);
   }
   game.interest = Math.max(0, Math.min(100, game.interest));
+  female.target = 1 - game.interest / 100;
   showRating(result);
   renderHud();
 }
@@ -272,9 +355,7 @@ function judge(e) {
 function renderHud() {
   els.score.textContent = game.score;
   els.combo.textContent = game.combo;
-  els.affection.style.width = game.interest + "%";
-  document.documentElement.style.setProperty("--near", (game.interest / 100).toFixed(2));
-  document.documentElement.style.setProperty("--glow", Math.min(game.combo / 8, 1).toFixed(2));
+  document.documentElement.style.setProperty("--glow", Math.min(game.combo / 12, 1).toFixed(2));
 }
 
 function showRating(result) {
@@ -284,14 +365,67 @@ function showRating(result) {
   els.rating.classList.add("show", result);
 }
 
-function setMood(mood) {
-  els.hen.dataset.mood = mood;
+function endGame() {
+  state = "done";
+  els.song.pause();
+  els.pauseBtn.hidden = true;
+  els.message.innerHTML = "";
+  const won = game.interest >= WIN_INTEREST;
+  if (won) {
+    flyDown();
+    setTimeout(() => spawnHearts(6), 1900);
+  }
+
+  setTimeout(() => {
+    els.results.innerHTML = `
+      <h1>${won ? "She chose you!" : "She flew off…"}</h1>
+      <p>${won ? "Your display won her over." : "Your display didn't impress her this time."}</p>
+      <p>Score ${game.score} · Best combo ${game.best} · ${game.perfect} perfect · ${game.good} good · ${game.miss} missed</p>`;
+    els.results.hidden = false;
+    els.playLabel.textContent = "AGAIN";
+    els.curtains.classList.remove("open", "gone");
+  }, won ? 4200 : 2200);
 }
 
-// Her resting mood follows how interested she is overall
-function restMood() {
-  if (state !== "playing") return;
-  setMood(game.interest >= WIN_INTEREST ? "interested" : "neutral");
+// ---------- Female ----------
+
+function branchPoint(p) {
+  const f = Math.max(0, Math.min(1, p)) * (BRANCH.length - 1);
+  const i = Math.min(BRANCH.length - 2, Math.floor(f));
+  const k = f - i;
+  return [BRANCH[i][0] + (BRANCH[i + 1][0] - BRANCH[i][0]) * k, BRANCH[i][1] + (BRANCH[i + 1][1] - BRANCH[i][1]) * k];
+}
+
+function flyDown() {
+  female.landed = true;
+  els.female.classList.remove("walking");
+  els.female.classList.add("landing");
+  els.female.style.setProperty("--face", -1); // face him as she lands
+  els.female.style.left = LANDING_SPOT[0] * 100 + "%";
+  els.female.style.top = LANDING_SPOT[1] * 100 + "%";
+}
+
+// She walks toward her target spot, faces the way she's walking, then turns to watch him
+function updateFemale(dt, now) {
+  if (female.landed) return;
+  const delta = female.target - female.pos;
+  const step = Math.sign(delta) * Math.min(Math.abs(delta), 0.12 * dt);
+  const moving = Math.abs(delta) > 0.002;
+  female.pos += step;
+
+  if (moving) {
+    female.face = step < 0 ? -1 : 1; // the art faces right; closer is to the left
+    female.stillSince = now;
+  } else if (now - female.stillSince > 1500) {
+    female.face = -1; // settled: turn to watch the male
+  }
+
+  const [x, y] = branchPoint(female.pos);
+  els.female.style.left = (x * 100).toFixed(2) + "%";
+  els.female.style.top = (y * 100).toFixed(2) + "%";
+  els.female.style.setProperty("--face", female.face);
+  els.female.classList.toggle("walking", moving);
+  els.female.classList.toggle("smitten", game ? game.interest >= WIN_INTEREST : false);
 }
 
 function spawnHearts(n) {
@@ -299,129 +433,24 @@ function spawnHearts(n) {
     const h = document.createElement("span");
     h.className = "heart";
     h.textContent = "❤";
-    h.style.color = "#ff4fa3";
-    h.style.setProperty("--dx", (Math.random() * 60 - 30).toFixed(0) + "px");
+    h.style.setProperty("--dx", (Math.random() * 4 - 2).toFixed(1) + "vw");
     h.style.animationDelay = i * 0.15 + "s";
-    els.henWrap.appendChild(h);
-    setTimeout(() => h.remove(), 1800);
+    els.female.appendChild(h);
+    setTimeout(() => h.remove(), 2000);
   }
 }
 
-function endGame() {
-  state = "done";
-  els.moveName.textContent = "";
-  els.beatDots.innerHTML = "";
-  const won = game.interest >= WIN_INTEREST;
-  if (won) {
-    setMood("accept");
-    els.henWrap.classList.add("won");
-    spawnHearts(6);
-  } else {
-    setMood("neutral");
-    els.henWrap.classList.add("leaving");
-  }
+// ---------- Debug (add ?debug to the URL) ----------
 
-  setTimeout(() => {
-    els.overlay.querySelector(".card").innerHTML = `
-      <h1>${won ? "She's charmed!" : "She wandered off…"}</h1>
-      <p class="lede">${won ? "Your display won her over. Time to build a nest." : "Your display didn't impress her this time."}</p>
-      <div class="stats">
-        <span>Score ${game.score}</span>
-        <span>Best combo ${game.best}</span>
-        <span>Interest ${game.interest}%</span>
-      </div>
-      <p>${game.perfect} perfect · ${game.good} good · ${game.miss} missed</p>
-      <button id="again-btn">Strut again</button>`;
-    $("again-btn").addEventListener("click", startGame);
-    els.overlay.classList.remove("hidden");
-  }, 2500);
+function buildDebug() {
+  els.debug.hidden = false;
+  els.debug.innerHTML = labels.map((l) => `<div class="bar"><span>${l}</span><div class="track"><div class="fill"></div></div></div>`).join("") + `<div id="beat"></div>`;
 }
 
-// ---------- Music (synthesized oom-pah) ----------
-
-const CHORDS = {
-  Beak: [261.63, 329.63, 392.0],   // C
-  Flap: [196.0, 246.94, 293.66],   // G
-  Boogie: [196.0, 246.94, 293.66], // G
-  Clap: [261.63, 329.63, 392.0],   // C
-};
-
-function scheduleMusic() {
-  for (const e of timeline.events) {
-    const beats = Math.round(e.dur / e.beat);
-    for (let i = 0; i < beats; i++) {
-      const at = audioStart + e.start + i * e.beat;
-      if (e.type === "count") {
-        blip(at, i === 3 ? 1320 : 880);
-        continue;
-      }
-      const chord = CHORDS[e.move];
-      kick(at);
-      hat(at + e.beat / 2);
-      if (i % 2 === 0) tone(chord[0] / 2, at, e.beat * 0.8, "triangle", 0.35);
-      else chord.forEach((f) => tone(f, at, e.beat * 0.35, "square", 0.05));
-      if (e.move === "Clap") clap(at);
-    }
-  }
-}
-
-function tone(freq, at, dur, type, vol) {
-  const o = audio.createOscillator();
-  const g = audio.createGain();
-  o.type = type;
-  o.frequency.value = freq;
-  g.gain.setValueAtTime(vol, at);
-  g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
-  o.connect(g).connect(master);
-  o.start(at);
-  o.stop(at + dur + 0.02);
-}
-
-function kick(at) {
-  const o = audio.createOscillator();
-  const g = audio.createGain();
-  o.frequency.setValueAtTime(150, at);
-  o.frequency.exponentialRampToValueAtTime(40, at + 0.12);
-  g.gain.setValueAtTime(0.8, at);
-  g.gain.exponentialRampToValueAtTime(0.0001, at + 0.15);
-  o.connect(g).connect(master);
-  o.start(at);
-  o.stop(at + 0.16);
-}
-
-function makeNoise() {
-  const buf = audio.createBuffer(1, audio.sampleRate * 0.3, audio.sampleRate);
-  const data = buf.getChannelData(0);
-  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
-  return buf;
-}
-
-function noise(at, dur, vol, filterFreq) {
-  const src = audio.createBufferSource();
-  const f = audio.createBiquadFilter();
-  const g = audio.createGain();
-  src.buffer = noiseBuffer;
-  f.type = "highpass";
-  f.frequency.value = filterFreq;
-  g.gain.setValueAtTime(vol, at);
-  g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
-  src.connect(f).connect(g).connect(master);
-  src.start(at);
-  src.stop(at + dur);
-}
-
-function hat(at) { noise(at, 0.05, 0.15, 7000); }
-function clap(at) { noise(at, 0.12, 0.4, 1200); }
-function blip(at, freq) { tone(freq, at, 0.08, "sine", 0.4); }
-
-function chirp(at) {
-  const o = audio.createOscillator();
-  const g = audio.createGain();
-  o.frequency.setValueAtTime(900, at);
-  o.frequency.exponentialRampToValueAtTime(1600, at + 0.08);
-  g.gain.setValueAtTime(0.15, at);
-  g.gain.exponentialRampToValueAtTime(0.0001, at + 0.12);
-  o.connect(g).connect(master);
-  o.start(at);
-  o.stop(at + 0.13);
+function updateDebug(prediction) {
+  prediction.forEach((p, i) => {
+    els.debug.children[i].querySelector(".fill").style.width = (p.probability * 100).toFixed(0) + "%";
+  });
+  const beat = (els.song.currentTime - FIRST_BEAT) * BPM / 60;
+  $("beat").textContent = `t ${els.song.currentTime.toFixed(2)}s · beat ${Math.floor(beat)}`;
 }
